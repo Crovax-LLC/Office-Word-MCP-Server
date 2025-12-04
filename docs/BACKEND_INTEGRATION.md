@@ -163,15 +163,21 @@ The Word MCP Server supports direct S3 file paths. You can pass S3 URIs anywhere
 2. Process it locally
 3. Upload the result to a **NEW** S3 path (original file is never modified)
 
-### Important: S3 Files Are Never Overwritten
+### Important: Original S3 Files Are Never Overwritten
 
-When you edit an S3 file, the server creates a **new versioned file** with a timestamp. The original file remains untouched. This is a safety feature to prevent accidental data loss.
+When you edit an S3 file, the behavior depends on whether it's an original or already-edited file:
 
-**Example:**
+**First edit (original file):**
 - Input: `s3://baugpt-files/contracts/contract.docx`
 - Output: `s3://baugpt-files/contracts/contract_edited_1733322400.docx`
+- Original file remains untouched
 
-The tool response will include the new file path. **Your backend must use this returned path** to update references in your database.
+**Subsequent edits (already-edited file):**
+- Input: `s3://baugpt-files/contracts/contract_edited_1733322400.docx`
+- Output: `s3://baugpt-files/contracts/contract_edited_1733322400.docx` (same file, updated in place)
+- No new copies created
+
+This prevents infinite file copies while still protecting original files. The tool response will include the file path used. **Your backend should track this path** to continue editing the same working copy.
 
 ### S3 URI Format
 

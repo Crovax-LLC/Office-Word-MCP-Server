@@ -101,18 +101,20 @@ class S3FileContext:
     """Context manager for transparent S3 file handling.
 
     Downloads S3 files to temp location, provides local paths for processing,
-    and uploads results to a NEW S3 path (never overwrites original).
+    and uploads results back to S3.
 
-    IMPORTANT: For S3 files, edits are ALWAYS saved to a new file with timestamp.
-    The original file is never modified. Use get_result_path() to get the new path.
+    IMPORTANT: Original files (without '_edited_' in name) are NEVER overwritten.
+    - First edit of original file: Creates new versioned file (doc_edited_1733318400.docx)
+    - Subsequent edits of edited file: Updates in place (no new copies)
 
     Example:
         with S3FileContext("s3://bucket/doc.docx") as ctx:
             doc = Document(ctx.local_path)
             # ... modify doc ...
             doc.save(ctx.local_path)
-        # File is uploaded to NEW path: s3://bucket/doc_edited_1733318400.docx
-        new_path = ctx.get_result_path()  # Returns the new S3 URI
+        # First edit: uploaded to s3://bucket/doc_edited_1733318400.docx
+        # If editing doc_edited_1733318400.docx: updates same file in place
+        new_path = ctx.get_result_path()
     """
 
     def __init__(self, filename: str, read_only: bool = False, output_s3_uri: Optional[str] = None):
@@ -131,14 +133,24 @@ class S3FileContext:
         self._output_temp_file = None
         self.output_local_path = None
 
-        # For S3 write operations, generate a new output path (never overwrite)
+        # For S3 write operations, determine output path
         if output_s3_uri:
             self.output_s3_uri = output_s3_uri
         elif self.is_s3 and not read_only:
-            # Generate new path with timestamp: doc.docx -> doc_edited_1733318400.docx
-            self.output_s3_uri = self._generate_versioned_path(filename)
+            if self._is_already_edited(filename):
+                # Already an edited file - update in place
+                self.output_s3_uri = filename
+            else:
+                # Original file - create new versioned copy
+                self.output_s3_uri = self._generate_versioned_path(filename)
         else:
             self.output_s3_uri = None
+
+    def _is_already_edited(self, s3_uri: str) -> bool:
+        """Check if file is already an edited version (has _edited_ in name)."""
+        import re
+        # Match pattern: _edited_<timestamp> before extension
+        return bool(re.search(r'_edited_\d+\.docx$', s3_uri))
 
     def _generate_versioned_path(self, s3_uri: str) -> str:
         """Generate a new S3 path with timestamp to avoid overwriting original."""
