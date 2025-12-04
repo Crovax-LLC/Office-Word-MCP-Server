@@ -11,7 +11,8 @@ from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_COLOR_INDEX
 from docx.enum.style import WD_STYLE_TYPE
 
-from word_document_server.utils.file_utils import check_file_writeable, ensure_docx_extension
+from word_document_server.utils.file_utils import check_file_writeable, ensure_docx_extension, S3FileContext
+from word_document_server.utils.s3_utils import is_s3_uri
 from word_document_server.core.styles import create_style
 from word_document_server.core.tables import (
     apply_table_style, set_cell_shading_by_position, apply_alternating_row_shading,
@@ -22,14 +23,14 @@ from word_document_server.core.tables import (
 )
 
 
-async def format_text(filename: str, paragraph_index: int, start_pos: int, end_pos: int, 
-                     bold: Optional[bool] = None, italic: Optional[bool] = None, 
+async def format_text(filename: str, paragraph_index: int, start_pos: int, end_pos: int,
+                     bold: Optional[bool] = None, italic: Optional[bool] = None,
                      underline: Optional[bool] = None, color: Optional[str] = None,
                      font_size: Optional[int] = None, font_name: Optional[str] = None) -> str:
     """Format a specific range of text within a paragraph.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         paragraph_index: Index of the paragraph (0-based)
         start_pos: Start position within the paragraph text
         end_pos: End position within the paragraph text
@@ -41,7 +42,7 @@ async def format_text(filename: str, paragraph_index: int, start_pos: int, end_p
         font_name: Font name/family
     """
     filename = ensure_docx_extension(filename)
-    
+
     # Ensure numeric parameters are the correct type
     try:
         paragraph_index = int(paragraph_index)
@@ -51,83 +52,87 @@ async def format_text(filename: str, paragraph_index: int, start_pos: int, end_p
             font_size = int(font_size)
     except (ValueError, TypeError):
         return "Invalid parameter: paragraph_index, start_pos, end_pos, and font_size must be integers"
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first."
-    
+
     try:
-        doc = Document(filename)
-        
-        # Validate paragraph index
-        if paragraph_index < 0 or paragraph_index >= len(doc.paragraphs):
-            return f"Invalid paragraph index. Document has {len(doc.paragraphs)} paragraphs (0-{len(doc.paragraphs)-1})."
-        
-        paragraph = doc.paragraphs[paragraph_index]
-        text = paragraph.text
-        
-        # Validate text positions
-        if start_pos < 0 or end_pos > len(text) or start_pos >= end_pos:
-            return f"Invalid text positions. Paragraph has {len(text)} characters."
-        
-        # Get the text to format
-        target_text = text[start_pos:end_pos]
-        
-        # Clear existing runs and create three runs: before, target, after
-        for run in paragraph.runs:
-            run.clear()
-        
-        # Add text before target
-        if start_pos > 0:
-            run_before = paragraph.add_run(text[:start_pos])
-        
-        # Add target text with formatting
-        run_target = paragraph.add_run(target_text)
-        if bold is not None:
-            run_target.bold = bold
-        if italic is not None:
-            run_target.italic = italic
-        if underline is not None:
-            run_target.underline = underline
-        if color:
-            # Define common RGB colors
-            color_map = {
-                'red': RGBColor(255, 0, 0),
-                'blue': RGBColor(0, 0, 255),
-                'green': RGBColor(0, 128, 0),
-                'yellow': RGBColor(255, 255, 0),
-                'black': RGBColor(0, 0, 0),
-                'gray': RGBColor(128, 128, 128),
-                'white': RGBColor(255, 255, 255),
-                'purple': RGBColor(128, 0, 128),
-                'orange': RGBColor(255, 165, 0)
-            }
-            
-            try:
-                if color.lower() in color_map:
-                    # Use predefined RGB color
-                    run_target.font.color.rgb = color_map[color.lower()]
-                else:
-                    # Try to set color by name
-                    run_target.font.color.rgb = RGBColor.from_string(color)
-            except Exception as e:
-                # If all else fails, default to black
-                run_target.font.color.rgb = RGBColor(0, 0, 0)
-        if font_size:
-            run_target.font.size = Pt(font_size)
-        if font_name:
-            run_target.font.name = font_name
-        
-        # Add text after target
-        if end_pos < len(text):
-            run_after = paragraph.add_run(text[end_pos:])
-        
-        doc.save(filename)
-        return f"Text '{target_text}' formatted successfully in paragraph {paragraph_index}."
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first."
+
+            doc = Document(ctx.local_path)
+
+            # Validate paragraph index
+            if paragraph_index < 0 or paragraph_index >= len(doc.paragraphs):
+                return f"Invalid paragraph index. Document has {len(doc.paragraphs)} paragraphs (0-{len(doc.paragraphs)-1})."
+
+            paragraph = doc.paragraphs[paragraph_index]
+            text = paragraph.text
+
+            # Validate text positions
+            if start_pos < 0 or end_pos > len(text) or start_pos >= end_pos:
+                return f"Invalid text positions. Paragraph has {len(text)} characters."
+
+            # Get the text to format
+            target_text = text[start_pos:end_pos]
+
+            # Clear existing runs and create three runs: before, target, after
+            for run in paragraph.runs:
+                run.clear()
+
+            # Add text before target
+            if start_pos > 0:
+                run_before = paragraph.add_run(text[:start_pos])
+
+            # Add target text with formatting
+            run_target = paragraph.add_run(target_text)
+            if bold is not None:
+                run_target.bold = bold
+            if italic is not None:
+                run_target.italic = italic
+            if underline is not None:
+                run_target.underline = underline
+            if color:
+                # Define common RGB colors
+                color_map = {
+                    'red': RGBColor(255, 0, 0),
+                    'blue': RGBColor(0, 0, 255),
+                    'green': RGBColor(0, 128, 0),
+                    'yellow': RGBColor(255, 255, 0),
+                    'black': RGBColor(0, 0, 0),
+                    'gray': RGBColor(128, 128, 128),
+                    'white': RGBColor(255, 255, 255),
+                    'purple': RGBColor(128, 0, 128),
+                    'orange': RGBColor(255, 165, 0)
+                }
+
+                try:
+                    if color.lower() in color_map:
+                        # Use predefined RGB color
+                        run_target.font.color.rgb = color_map[color.lower()]
+                    else:
+                        # Try to set color by name
+                        run_target.font.color.rgb = RGBColor.from_string(color)
+                except Exception as e:
+                    # If all else fails, default to black
+                    run_target.font.color.rgb = RGBColor(0, 0, 0)
+            if font_size:
+                run_target.font.size = Pt(font_size)
+            if font_name:
+                run_target.font.name = font_name
+
+            # Add text after target
+            if end_pos < len(text):
+                run_after = paragraph.add_run(text[end_pos:])
+
+            doc.save(ctx.local_path)
+            return f"Text '{target_text}' formatted successfully in paragraph {paragraph_index}."
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to format text: {str(e)}"
 

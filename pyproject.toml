@@ -23,6 +23,7 @@ dependencies = [
     "msoffcrypto-tool>=5.4.2",
     "docx2pdf>=0.1.8",
     "pytest>=8.4.2",
+    "boto3>=1.35.0",
 ]
 
 [project.urls]

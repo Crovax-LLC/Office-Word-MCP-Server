@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install LibreOffice for PDF conversion
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /app
+RUN pip install --no-cache-dir .
+
+# Environment variables for HTTP transport
+ENV MCP_TRANSPORT=streamable-http
+ENV MCP_HOST=0.0.0.0
+ENV MCP_PORT=8000
+ENV FASTMCP_LOG_LEVEL=INFO
+
+EXPOSE 8000
+
+ENTRYPOINT ["word_mcp_server"]

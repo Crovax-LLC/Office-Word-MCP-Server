@@ -5,11 +5,13 @@ These tools add various types of content to Word documents,
 including headings, paragraphs, tables, images, and page breaks.
 """
 import os
+import tempfile
 from typing import List, Optional, Dict, Any
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 
-from word_document_server.utils.file_utils import check_file_writeable, ensure_docx_extension
+from word_document_server.utils.file_utils import check_file_writeable, ensure_docx_extension, S3FileContext
+from word_document_server.utils.s3_utils import is_s3_uri, download_from_s3
 from word_document_server.utils.document_utils import find_and_replace_text, insert_header_near_text, insert_numbered_list_near_text, insert_line_or_paragraph_near_text, replace_paragraph_block_below_header, replace_block_between_manual_anchors
 from word_document_server.core.styles import ensure_heading_style, ensure_table_style
 
@@ -21,7 +23,7 @@ async def add_heading(filename: str, text: str, level: int = 1,
     """Add a heading to a Word document with optional formatting.
 
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         text: Heading text
         level: Heading level (1-9, where 1 is the highest level)
         font_name: Font family (e.g., 'Helvetica')
@@ -42,70 +44,74 @@ async def add_heading(filename: str, text: str, level: int = 1,
     if level < 1 or level > 9:
         return f"Invalid heading level: {level}. Level must be between 1 and 9."
 
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        # Suggest creating a copy
-        return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
-
     try:
-        doc = Document(filename)
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
 
-        # Ensure heading styles exist
-        ensure_heading_style(doc)
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
 
-        # Try to add heading with style
-        try:
-            heading = doc.add_heading(text, level=level)
-        except Exception as style_error:
-            # If style-based approach fails, use direct formatting
-            heading = doc.add_paragraph(text)
-            heading.style = doc.styles['Normal']
-            if heading.runs:
-                run = heading.runs[0]
-                run.bold = True
-                # Adjust size based on heading level
-                if level == 1:
-                    run.font.size = Pt(16)
-                elif level == 2:
-                    run.font.size = Pt(14)
-                else:
-                    run.font.size = Pt(12)
+            doc = Document(ctx.local_path)
 
-        # Apply formatting to all runs in the heading
-        if any([font_name, font_size, bold is not None, italic is not None]):
-            for run in heading.runs:
-                if font_name:
-                    run.font.name = font_name
-                if font_size:
-                    run.font.size = Pt(font_size)
-                if bold is not None:
-                    run.font.bold = bold
-                if italic is not None:
-                    run.font.italic = italic
+            # Ensure heading styles exist
+            ensure_heading_style(doc)
 
-        # Add bottom border if requested
-        if border_bottom:
-            from docx.oxml import OxmlElement
-            from docx.oxml.ns import qn
+            # Try to add heading with style
+            try:
+                heading = doc.add_heading(text, level=level)
+            except Exception as style_error:
+                # If style-based approach fails, use direct formatting
+                heading = doc.add_paragraph(text)
+                heading.style = doc.styles['Normal']
+                if heading.runs:
+                    run = heading.runs[0]
+                    run.bold = True
+                    # Adjust size based on heading level
+                    if level == 1:
+                        run.font.size = Pt(16)
+                    elif level == 2:
+                        run.font.size = Pt(14)
+                    else:
+                        run.font.size = Pt(12)
 
-            pPr = heading._element.get_or_add_pPr()
-            pBdr = OxmlElement('w:pBdr')
+            # Apply formatting to all runs in the heading
+            if any([font_name, font_size, bold is not None, italic is not None]):
+                for run in heading.runs:
+                    if font_name:
+                        run.font.name = font_name
+                    if font_size:
+                        run.font.size = Pt(font_size)
+                    if bold is not None:
+                        run.font.bold = bold
+                    if italic is not None:
+                        run.font.italic = italic
 
-            bottom = OxmlElement('w:bottom')
-            bottom.set(qn('w:val'), 'single')
-            bottom.set(qn('w:sz'), '4')  # 0.5pt border
-            bottom.set(qn('w:space'), '0')
-            bottom.set(qn('w:color'), '000000')
+            # Add bottom border if requested
+            if border_bottom:
+                from docx.oxml import OxmlElement
+                from docx.oxml.ns import qn
 
-            pBdr.append(bottom)
-            pPr.append(pBdr)
+                pPr = heading._element.get_or_add_pPr()
+                pBdr = OxmlElement('w:pBdr')
 
-        doc.save(filename)
-        return f"Heading '{text}' (level {level}) added to {filename}"
+                bottom = OxmlElement('w:bottom')
+                bottom.set(qn('w:val'), 'single')
+                bottom.set(qn('w:sz'), '4')  # 0.5pt border
+                bottom.set(qn('w:space'), '0')
+                bottom.set(qn('w:color'), '000000')
+
+                pBdr.append(bottom)
+                pPr.append(pBdr)
+
+            doc.save(ctx.local_path)
+            result_path = ctx.get_result_path()
+            return f"Heading '{text}' (level {level}) added to {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to add heading: {str(e)}"
 
@@ -117,7 +123,7 @@ async def add_paragraph(filename: str, text: str, style: Optional[str] = None,
     """Add a paragraph to a Word document with optional formatting.
 
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         text: Paragraph text
         style: Optional paragraph style name
         font_name: Font family (e.g., 'Helvetica', 'Times New Roman')
@@ -128,335 +134,385 @@ async def add_paragraph(filename: str, text: str, style: Optional[str] = None,
     """
     filename = ensure_docx_extension(filename)
 
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        # Suggest creating a copy
-        return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
-
     try:
-        doc = Document(filename)
-        paragraph = doc.add_paragraph(text)
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
 
-        if style:
-            try:
-                paragraph.style = style
-            except KeyError:
-                # Style doesn't exist, use normal and report it
-                paragraph.style = doc.styles['Normal']
-                doc.save(filename)
-                return f"Style '{style}' not found, paragraph added with default style to {filename}"
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
 
-        # Apply formatting to all runs in the paragraph
-        if any([font_name, font_size, bold is not None, italic is not None, color]):
-            for run in paragraph.runs:
-                if font_name:
-                    run.font.name = font_name
-                if font_size:
-                    run.font.size = Pt(font_size)
-                if bold is not None:
-                    run.font.bold = bold
-                if italic is not None:
-                    run.font.italic = italic
-                if color:
-                    # Remove any '#' prefix if present
-                    color_hex = color.lstrip('#')
-                    run.font.color.rgb = RGBColor.from_string(color_hex)
+            doc = Document(ctx.local_path)
+            paragraph = doc.add_paragraph(text)
 
-        doc.save(filename)
-        return f"Paragraph added to {filename}"
+            if style:
+                try:
+                    paragraph.style = style
+                except KeyError:
+                    # Style doesn't exist, use normal and report it
+                    paragraph.style = doc.styles['Normal']
+                    doc.save(ctx.local_path)
+                    result_path = ctx.get_result_path()
+                    return f"Style '{style}' not found, paragraph added with default style to {result_path}"
+
+            # Apply formatting to all runs in the paragraph
+            if any([font_name, font_size, bold is not None, italic is not None, color]):
+                for run in paragraph.runs:
+                    if font_name:
+                        run.font.name = font_name
+                    if font_size:
+                        run.font.size = Pt(font_size)
+                    if bold is not None:
+                        run.font.bold = bold
+                    if italic is not None:
+                        run.font.italic = italic
+                    if color:
+                        # Remove any '#' prefix if present
+                        color_hex = color.lstrip('#')
+                        run.font.color.rgb = RGBColor.from_string(color_hex)
+
+            doc.save(ctx.local_path)
+            result_path = ctx.get_result_path()
+            return f"Paragraph added to {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to add paragraph: {str(e)}"
 
 
 async def add_table(filename: str, rows: int, cols: int, data: Optional[List[List[str]]] = None) -> str:
     """Add a table to a Word document.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         rows: Number of rows in the table
         cols: Number of columns in the table
         data: Optional 2D array of data to fill the table
     """
     filename = ensure_docx_extension(filename)
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        # Suggest creating a copy
-        return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
-    
+
     try:
-        doc = Document(filename)
-        table = doc.add_table(rows=rows, cols=cols)
-        
-        # Try to set the table style
-        try:
-            table.style = 'Table Grid'
-        except KeyError:
-            # If style doesn't exist, add basic borders
-            pass
-        
-        # Fill table with data if provided
-        if data:
-            for i, row_data in enumerate(data):
-                if i >= rows:
-                    break
-                for j, cell_text in enumerate(row_data):
-                    if j >= cols:
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
+
+            doc = Document(ctx.local_path)
+            table = doc.add_table(rows=rows, cols=cols)
+
+            # Try to set the table style
+            try:
+                table.style = 'Table Grid'
+            except KeyError:
+                # If style doesn't exist, add basic borders
+                pass
+
+            # Fill table with data if provided
+            if data:
+                for i, row_data in enumerate(data):
+                    if i >= rows:
                         break
-                    table.cell(i, j).text = str(cell_text)
-        
-        doc.save(filename)
-        return f"Table ({rows}x{cols}) added to {filename}"
+                    for j, cell_text in enumerate(row_data):
+                        if j >= cols:
+                            break
+                        table.cell(i, j).text = str(cell_text)
+
+            doc.save(ctx.local_path)
+            result_path = ctx.get_result_path()
+            return f"Table ({rows}x{cols}) added to {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to add table: {str(e)}"
 
 
 async def add_picture(filename: str, image_path: str, width: Optional[float] = None) -> str:
     """Add an image to a Word document.
-    
+
     Args:
-        filename: Path to the Word document
-        image_path: Path to the image file
+        filename: Path to the Word document (local path or S3 URI)
+        image_path: Path to the image file (local path or S3 URI)
         width: Optional width in inches (proportional scaling)
     """
     filename = ensure_docx_extension(filename)
-    
-    # Validate document existence
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Get absolute paths for better diagnostics
-    abs_filename = os.path.abspath(filename)
-    abs_image_path = os.path.abspath(image_path)
-    
-    # Validate image existence with improved error message
-    if not os.path.exists(abs_image_path):
-        return f"Image file not found: {abs_image_path}"
-    
-    # Check image file size
+
+    # Track temp files for cleanup
+    temp_files = []
+
     try:
-        image_size = os.path.getsize(abs_image_path) / 1024  # Size in KB
-        if image_size <= 0:
-            return f"Image file appears to be empty: {abs_image_path} (0 KB)"
-    except Exception as size_error:
-        return f"Error checking image file: {str(size_error)}"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(abs_filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
-    
-    try:
-        doc = Document(abs_filename)
-        # Additional diagnostic info
-        diagnostic = f"Attempting to add image ({abs_image_path}, {image_size:.2f} KB) to document ({abs_filename})"
-        
+        # Handle image from S3
+        local_image_path = image_path
+        if is_s3_uri(image_path):
+            success, message, local_image_path = download_from_s3(image_path)
+            if not success:
+                return f"Failed to download image from S3: {message}"
+            temp_files.append(local_image_path)
+        else:
+            # Validate image existence with improved error message
+            abs_image_path = os.path.abspath(image_path)
+            if not os.path.exists(abs_image_path):
+                return f"Image file not found: {abs_image_path}"
+            local_image_path = abs_image_path
+
+        # Check image file size
         try:
-            if width:
-                doc.add_picture(abs_image_path, width=Inches(width))
-            else:
-                doc.add_picture(abs_image_path)
-            doc.save(abs_filename)
-            return f"Picture {image_path} added to {filename}"
-        except Exception as inner_error:
-            # More detailed error for the specific operation
-            error_type = type(inner_error).__name__
-            error_msg = str(inner_error)
-            return f"Failed to add picture: {error_type} - {error_msg or 'No error details available'}\nDiagnostic info: {diagnostic}"
+            image_size = os.path.getsize(local_image_path) / 1024  # Size in KB
+            if image_size <= 0:
+                return f"Image file appears to be empty: {local_image_path} (0 KB)"
+        except Exception as size_error:
+            return f"Error checking image file: {str(size_error)}"
+
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first or creating a new document."
+
+            doc = Document(ctx.local_path)
+            # Additional diagnostic info
+            diagnostic = f"Attempting to add image ({local_image_path}, {image_size:.2f} KB) to document"
+
+            try:
+                if width:
+                    doc.add_picture(local_image_path, width=Inches(width))
+                else:
+                    doc.add_picture(local_image_path)
+                doc.save(ctx.local_path)
+                result_path = ctx.get_result_path()
+                return f"Picture {image_path} added to {result_path}"
+            except Exception as inner_error:
+                # More detailed error for the specific operation
+                error_type = type(inner_error).__name__
+                error_msg = str(inner_error)
+                return f"Failed to add picture: {error_type} - {error_msg or 'No error details available'}\nDiagnostic info: {diagnostic}"
+    except IOError as e:
+        return str(e)
     except Exception as outer_error:
         # Fallback error handling
         error_type = type(outer_error).__name__
         error_msg = str(outer_error)
         return f"Document processing error: {error_type} - {error_msg or 'No error details available'}"
+    finally:
+        # Clean up temp files
+        for temp_file in temp_files:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
 
 
 async def add_page_break(filename: str) -> str:
     """Add a page break to the document.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
     """
     filename = ensure_docx_extension(filename)
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first."
-    
+
     try:
-        doc = Document(filename)
-        doc.add_page_break()
-        doc.save(filename)
-        return f"Page break added to {filename}."
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first."
+
+            doc = Document(ctx.local_path)
+            doc.add_page_break()
+            doc.save(ctx.local_path)
+            result_path = ctx.get_result_path()
+            return f"Page break added to {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to add page break: {str(e)}"
 
 
 async def add_table_of_contents(filename: str, title: str = "Table of Contents", max_level: int = 3) -> str:
     """Add a table of contents to a Word document based on heading styles.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         title: Optional title for the table of contents
         max_level: Maximum heading level to include (1-9)
     """
     filename = ensure_docx_extension(filename)
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first."
-    
+
     try:
-        # Ensure max_level is within valid range
-        max_level = max(1, min(max_level, 9))
-        
-        doc = Document(filename)
-        
-        # Collect headings and their positions
-        headings = []
-        for i, paragraph in enumerate(doc.paragraphs):
-            # Check if paragraph style is a heading
-            if paragraph.style and paragraph.style.name.startswith('Heading '):
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first."
+
+            # Ensure max_level is within valid range
+            max_level = max(1, min(max_level, 9))
+
+            doc = Document(ctx.local_path)
+
+            # Collect headings and their positions
+            headings = []
+            for i, paragraph in enumerate(doc.paragraphs):
+                # Check if paragraph style is a heading
+                if paragraph.style and paragraph.style.name.startswith('Heading '):
+                    try:
+                        # Extract heading level from style name
+                        level = int(paragraph.style.name.split(' ')[1])
+                        if level <= max_level:
+                            headings.append({
+                                'level': level,
+                                'text': paragraph.text,
+                                'position': i
+                            })
+                    except (ValueError, IndexError):
+                        # Skip if heading level can't be determined
+                        pass
+
+            if not headings:
+                return f"No headings found in document {filename}. Table of contents not created."
+
+            # Create a new document with the TOC
+            toc_doc = Document()
+
+            # Add title
+            if title:
+                toc_doc.add_heading(title, level=1)
+
+            # Add TOC entries
+            for heading in headings:
+                # Indent based on level (using tab characters)
+                indent = '    ' * (heading['level'] - 1)
+                toc_doc.add_paragraph(f"{indent}{heading['text']}")
+
+            # Add page break
+            toc_doc.add_page_break()
+
+            # Get content from original document
+            for paragraph in doc.paragraphs:
+                p = toc_doc.add_paragraph(paragraph.text)
+                # Copy style if possible
                 try:
-                    # Extract heading level from style name
-                    level = int(paragraph.style.name.split(' ')[1])
-                    if level <= max_level:
-                        headings.append({
-                            'level': level,
-                            'text': paragraph.text,
-                            'position': i
-                        })
-                except (ValueError, IndexError):
-                    # Skip if heading level can't be determined
+                    if paragraph.style:
+                        p.style = paragraph.style.name
+                except:
                     pass
-        
-        if not headings:
-            return f"No headings found in document {filename}. Table of contents not created."
-        
-        # Create a new document with the TOC
-        toc_doc = Document()
-        
-        # Add title
-        if title:
-            toc_doc.add_heading(title, level=1)
-        
-        # Add TOC entries
-        for heading in headings:
-            # Indent based on level (using tab characters)
-            indent = '    ' * (heading['level'] - 1)
-            toc_doc.add_paragraph(f"{indent}{heading['text']}")
-        
-        # Add page break
-        toc_doc.add_page_break()
-        
-        # Get content from original document
-        for paragraph in doc.paragraphs:
-            p = toc_doc.add_paragraph(paragraph.text)
-            # Copy style if possible
-            try:
-                if paragraph.style:
-                    p.style = paragraph.style.name
-            except:
-                pass
-        
-        # Copy tables
-        for table in doc.tables:
-            # Create a new table with the same dimensions
-            new_table = toc_doc.add_table(rows=len(table.rows), cols=len(table.columns))
-            # Copy cell contents
-            for i, row in enumerate(table.rows):
-                for j, cell in enumerate(row.cells):
-                    for paragraph in cell.paragraphs:
-                        new_table.cell(i, j).text = paragraph.text
-        
-        # Save the new document with TOC
-        toc_doc.save(filename)
-        
-        return f"Table of contents with {len(headings)} entries added to {filename}"
+
+            # Copy tables
+            for table in doc.tables:
+                # Create a new table with the same dimensions
+                new_table = toc_doc.add_table(rows=len(table.rows), cols=len(table.columns))
+                # Copy cell contents
+                for i, row in enumerate(table.rows):
+                    for j, cell in enumerate(row.cells):
+                        for paragraph in cell.paragraphs:
+                            new_table.cell(i, j).text = paragraph.text
+
+            # Save the new document with TOC
+            toc_doc.save(ctx.local_path)
+
+            result_path = ctx.get_result_path()
+            return f"Table of contents with {len(headings)} entries added to {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to add table of contents: {str(e)}"
 
 
 async def delete_paragraph(filename: str, paragraph_index: int) -> str:
     """Delete a paragraph from a document.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         paragraph_index: Index of the paragraph to delete (0-based)
     """
     filename = ensure_docx_extension(filename)
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first."
-    
+
     try:
-        doc = Document(filename)
-        
-        # Validate paragraph index
-        if paragraph_index < 0 or paragraph_index >= len(doc.paragraphs):
-            return f"Invalid paragraph index. Document has {len(doc.paragraphs)} paragraphs (0-{len(doc.paragraphs)-1})."
-        
-        # Delete the paragraph (by removing its content and setting it empty)
-        # Note: python-docx doesn't support true paragraph deletion, this is a workaround
-        paragraph = doc.paragraphs[paragraph_index]
-        p = paragraph._p
-        p.getparent().remove(p)
-        
-        doc.save(filename)
-        return f"Paragraph at index {paragraph_index} deleted successfully."
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first."
+
+            doc = Document(ctx.local_path)
+
+            # Validate paragraph index
+            if paragraph_index < 0 or paragraph_index >= len(doc.paragraphs):
+                return f"Invalid paragraph index. Document has {len(doc.paragraphs)} paragraphs (0-{len(doc.paragraphs)-1})."
+
+            # Delete the paragraph (by removing its content and setting it empty)
+            # Note: python-docx doesn't support true paragraph deletion, this is a workaround
+            paragraph = doc.paragraphs[paragraph_index]
+            p = paragraph._p
+            p.getparent().remove(p)
+
+            doc.save(ctx.local_path)
+            result_path = ctx.get_result_path()
+            return f"Paragraph at index {paragraph_index} deleted from {result_path}"
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to delete paragraph: {str(e)}"
 
 
 async def search_and_replace(filename: str, find_text: str, replace_text: str) -> str:
     """Search for text and replace all occurrences.
-    
+
     Args:
-        filename: Path to the Word document
+        filename: Path to the Word document (local path or S3 URI)
         find_text: Text to search for
         replace_text: Text to replace with
     """
     filename = ensure_docx_extension(filename)
-    
-    if not os.path.exists(filename):
-        return f"Document {filename} does not exist"
-    
-    # Check if file is writeable
-    is_writeable, error_message = check_file_writeable(filename)
-    if not is_writeable:
-        return f"Cannot modify document: {error_message}. Consider creating a copy first."
-    
+
     try:
-        doc = Document(filename)
-        
-        # Perform find and replace
-        count = find_and_replace_text(doc, find_text, replace_text)
-        
-        if count > 0:
-            doc.save(filename)
-            return f"Replaced {count} occurrence(s) of '{find_text}' with '{replace_text}'."
-        else:
-            return f"No occurrences of '{find_text}' found."
+        with S3FileContext(filename) as ctx:
+            if not os.path.exists(ctx.local_path):
+                return f"Document {filename} does not exist"
+
+            # Check if file is writeable (only for local files)
+            if not ctx.is_s3:
+                is_writeable, error_message = check_file_writeable(ctx.local_path)
+                if not is_writeable:
+                    return f"Cannot modify document: {error_message}. Consider creating a copy first."
+
+            doc = Document(ctx.local_path)
+
+            # Perform find and replace
+            count = find_and_replace_text(doc, find_text, replace_text)
+
+            if count > 0:
+                doc.save(ctx.local_path)
+                result_path = ctx.get_result_path()
+                return f"Replaced {count} occurrence(s) of '{find_text}' with '{replace_text}' in {result_path}"
+            else:
+                return f"No occurrences of '{find_text}' found."
+    except IOError as e:
+        return str(e)
     except Exception as e:
         return f"Failed to search and replace: {str(e)}"
 
