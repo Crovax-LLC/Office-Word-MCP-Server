@@ -161,12 +161,56 @@ public function register(): void
 The Word MCP Server supports direct S3 file paths. You can pass S3 URIs anywhere a filename is expected, and the server will automatically:
 1. Download the file from S3
 2. Process it locally
-3. Upload the result back to S3
+3. Upload the result to a **NEW** S3 path (original file is never modified)
+
+### Important: S3 Files Are Never Overwritten
+
+When you edit an S3 file, the server creates a **new versioned file** with a timestamp. The original file remains untouched. This is a safety feature to prevent accidental data loss.
+
+**Example:**
+- Input: `s3://baugpt-files/contracts/contract.docx`
+- Output: `s3://baugpt-files/contracts/contract_edited_1733322400.docx`
+
+The tool response will include the new file path. **Your backend must use this returned path** to update references in your database.
 
 ### S3 URI Format
 
 ```
 s3://bucket-name/path/to/file.docx
+```
+
+### Handling Returned Paths
+
+Since S3 edits create new files, always capture and use the returned path:
+
+```php
+// IMPORTANT: Capture the returned path for S3 files
+$result = $this->wordService->callTool('add_paragraph', [
+    'filename' => 's3://baugpt-files/contracts/contract.docx',
+    'text' => 'New paragraph content',
+]);
+
+// Result contains the NEW file path, e.g.:
+// "Paragraph added to s3://baugpt-files/contracts/contract_edited_1733322400.docx"
+
+// Parse the new path from the result and update your database
+$newPath = $this->extractPathFromResult($result);
+$document->update(['s3_path' => $newPath]);
+```
+
+### Helper Method to Extract S3 Path
+
+```php
+/**
+ * Extract S3 path from MCP tool response
+ */
+protected function extractS3PathFromResult(string $result): ?string
+{
+    if (preg_match('/(s3:\/\/[^\s]+\.docx)/', $result, $matches)) {
+        return $matches[1];
+    }
+    return null;
+}
 ```
 
 ### Examples
@@ -184,12 +228,14 @@ $text = $this->wordService->callTool('get_document_text', [
     'filename' => 's3://baugpt-documents/templates/contract.docx',
 ]);
 
-// Modify a document in S3 (downloads, modifies, uploads back)
-$this->wordService->callTool('search_and_replace', [
-    'filename' => 's3://baugpt-documents/contracts/contract_001.docx',
+// Modify a document in S3 (creates NEW versioned file)
+$result = $this->wordService->callTool('search_and_replace', [
+    'filename' => 's3://baugpt-files/contracts/contract_001.docx',
     'find_text' => '{{CLIENT_NAME}}',
     'replace_text' => 'Acme Corp',
 ]);
+// Result: "Replaced 3 occurrence(s) ... in s3://baugpt-files/contracts/contract_001_edited_1733322400.docx"
+// Original contract_001.docx is unchanged!
 
 // Copy from S3 to S3
 $this->wordService->callTool('copy_document', [
@@ -243,7 +289,24 @@ All document tools support S3 URIs, including:
 
 ### S3 Permissions
 
-The EC2 instance has S3 full access via its IAM role (`WordMcpServerEC2Role`). Ensure your S3 bucket allows access from the EC2 instance.
+The EC2 instance has **restricted S3 access** via its IAM role (`WordMcpServerEC2Role`):
+
+- **Bucket**: `baugpt-files` only
+- **Actions**: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`
+
+The server cannot access any other S3 buckets. This is a security measure to prevent accidental access to unrelated data.
+
+### Read-Only Operations
+
+For read-only operations (like `get_document_text` or `get_document_info`), the original file path is returned since no new file is created:
+
+```php
+// Read-only - returns original path
+$text = $this->wordService->callTool('get_document_text', [
+    'filename' => 's3://baugpt-files/contracts/contract.docx',
+]);
+// No new file created, original remains unchanged
+```
 
 ---
 
